@@ -7,7 +7,7 @@
       "key": "dr_douban",
       "name": "[影视]豆瓣",
       "type": 3,
-      "api": "https://gitee.com/a-3000/11/raw/master/2.js",
+      "api": "https://raw.githubusercontent.com/waitforfate/1/refs/heads/main/1.js",
       "searchable": 1,
       "quickSearch": 1,
       "filterable": 1
