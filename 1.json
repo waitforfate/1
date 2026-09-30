@@ -7,12 +7,11 @@
       "key": "dr_douban",
       "name": "[影视]豆瓣",
       "type": 3,
-      "api": "https://raw.githubusercontent.com/waitforfate/1/refs/heads/main/1.js",
+      "api": "https://cdn.jsdelivr.net/gh/waitforfate/1@main/1.js",
       "searchable": 1,
       "quickSearch": 1,
       "filterable": 1
     },
-
     {
       "key": "bfzyapicom",
       "name": "[影视]暴风资源",
@@ -355,7 +354,6 @@
       "quickSearch": 1,
       "filterable": 1
     },
-
     {
       "key": "玩偶",
       "name": "[高清]玩偶",
@@ -592,7 +590,6 @@
       },
       "timeout": 60
     },
-
     {
       "key": "荐片",
       "name": "[BT]荐片",
@@ -628,7 +625,6 @@
       "filterable": 1,
       "ext": "https://xunlei8.me"
     },
-
     {
       "key": "阿里云盘",
       "name": "[网盘]阿里",
@@ -733,7 +729,6 @@
         "ratio": 1.433
       }
     },
-
     {
       "key": "觅盘",
       "name": "[搜索]觅盘",
