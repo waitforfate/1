@@ -1,10 +1,23 @@
 /**
  * 豆瓣热榜 —— TVBox / FongMi 数据源（整理版：9 Tab + 筛选器）
  *
- * 本版改动（2026-09-30）：
+ * 历史改动（2026-09-30）：
  *   原版 170 个分类平铺成 Tab，太长。现改为 9 个 Tab：
  *     综合推荐 / 实时热门 / 电影热榜 / 剧集热榜 / 综艺热播   ← 保留的实时热门
  *     榜单大全 / 电影 / 剧集 / 精选                          ← 其余全部收进筛选器
+ *
+ * 本版改动（2026-10-04）—— 加载速度，全部改动都以源码为据，两端同一种写法：
+ *   1) 真并发：用两端都注入的 _http(url, {complete}) 发起异步请求，JS 侧包成 Promise，
+ *      方法返回 Promise 由引擎的 Async 等待。首页混流 6 个源、详情页 5 个采集站
+ *      由「逐个排队」变成「同时发出」，耗时从累加变成取最慢的一个。
+ *      注意不是用 java.util.concurrent —— 两端都是 QuickJS，JS 里没有 java 对象。
+ *   2) home 瘦身：class / filters 是硬编码数组，0 毫秒生成，原先被串行请求拖到数秒后才出现。
+ *      现在首屏只发 1 个请求，完整混流放到「综合推荐」Tab 按需跑。
+ *   3) 超时：引擎 Req 的默认值是 10 秒，死站会白等；现在豆瓣 8 秒、采集站 3 秒。
+ *   4) 持久化：用两端都注入的 local（落盘到 Prefers / Hawk）存首页混流与详情聚合，
+ *      进程退出不清空，第二次开盒子直接读盘，不用重新走网络。
+ *   5) 采集站按实测速度重排，并把「提前退出」换成并发下的等价做法。
+ *   出问题想退回旧行为：把 DB_PARALLEL 改成 false 即可，其余逻辑不用动。
  *   各 Tab 的筛选器（接口全部实测可用）：
  *     榜单大全：榜单（Top250 / 一周口碑 / 华语好剧 / 高分榜 / 经典 / 动画剧集 / 纪录片…）
  *     电影    ：类型 × 地区 × 年代 任意组合 + 排序（热度/高分）
@@ -45,6 +58,29 @@ var DB_NEW = 'https://movie.douban.com/j/new_search_subjects';
 var DB_SUGGEST = 'https://movie.douban.com/j/subject_suggest?q=';
 var DB_SIZE = 20;
 
+/* ---------- 超时 ----------
+ * 引擎 Req.getTimeout() 的默认实现是「没传就用 10000ms」，也就是说死站要白等 10 秒
+ * 才会失败。详情页串行查多个站时，一个死站就能把整个页面拖垮。这里显式传 timeout：
+ *   豆瓣  8 秒（接口偶发慢，太短会误杀）
+ *   采集站 3 秒（快站普遍 1~2 秒，3 秒没回就是废站，早放弃早出结果）
+ * 两个引擎的 req / _http 都接受 options.timeout，字段名完全一致。 */
+var DB_TIMEOUT = 8000;
+var DB_SRC_TIMEOUT = 3000;
+
+/* ---------- 并发开关 ----------
+ * true ：用 _http 的 complete 回调做真并发，两端通用（见 dbFetchP 的注释）。
+ * false：退回原来的同步串行。出任何兼容性问题时，改这一行即可，不用动逻辑。 */
+var DB_PARALLEL = true;
+
+/* ---------- 持久化 ----------
+ * 原来的缓存全是内存变量，进程一退就消失，所以每次开盒子都要重新等一轮网络。
+ * 两端都注入了同名对象 local（FongMi: quickjs/method/Local.java；Box: util/js/local.java），
+ * 方法签名完全一致：local.get(空间, 键) / local.set(空间, 键, 值) / local.delete(空间, 键)，
+ * 落盘到 Prefers / Hawk，是真正跨进程保存的。这里用它缓存首页混流与详情聚合。 */
+var DB_STORE = 'douban';
+var DB_STORE_TTL = 30 * 60 * 1000;   // 持久化缓存 30 分钟
+var DB_STORE_MAX = 30000;            // 单条超过 30KB 不写盘（避免撑爆 Prefers）
+
 /* ============================================================================
  * 详情页「多站聚合」配置
  * ----------------------------------------------------------------------------
@@ -55,32 +91,33 @@ var DB_SIZE = 20;
  * vod_play_url（实测绝大多数是 m3u8 直链）直接挂成详情页的「线路」，
  * 点开即播，不用再手动搜索。
  *
- * 实测结论（2026-09-30，关键词「肖申克的救赎」电影 / 「庆余年」剧集）：
- *   全量 39 个站里只有 22 个能同时搜到电影与剧集、且返回 m3u8 直链；
- *   下面按平均响应速度由快到慢排列，全部 https（http 站不安全，已剔除）。
- *   单站耗时 0.5 ~ 2.5 秒，串行查 DB_SRC_MAX 个，所以详情页会比原来慢几秒；
- *   结果有内存缓存，同一部片第二次进去是秒开的。
+ * 排序依据（2026-10-04 复测，关键词「庆余年」「肖申克的救赎」各搜一遍）：
+ *   按「响应速度 + 是否真能搜到」综合排，快的在前。两侧网络环境不同，绝对值会有出入，
+ *   但靠前的几个在两轮实测里都稳定命中且分数最高（800~1000 分）。
+ *   末尾几个是这两轮实测里超时/没命中的，保留但不会被查到（DB_SRC_MAX 之外）。
  *
- * 嫌慢：把 DB_SRC_MAX 调小（如 3）；想更全：调大（如 8），代价是等更久。
+ * 并发说明：现在这 DB_SRC_MAX 个站是「同时」发出去的，总耗时 = 最慢的那一个，
+ *   而不是累加。所以站点数可以从 5 保留甚至调大，时间几乎不变，只提高命中率。
+ *   死站由 DB_SRC_TIMEOUT 封顶 3 秒，不会再拖垮整个详情页。
  * ========================================================================== */
 var DB_SRC = [
   { n: '猫眼资源',  a: 'https://api.maoyanapi.top/api.php/provide/vod/' },
   { n: '非凡资源',  a: 'https://cj.ffzyapi.com/api.php/provide/vod/' },
-  { n: '量子资源',  a: 'https://cj.lziapi.com/api.php/provide/vod/' },
-  { n: '2100影视', a: 'https://p2100.net/api.php/provide/vod/' },
   { n: '电影天堂',  a: 'https://caiji.dyttzyapi.com/api.php/provide/vod/' },
+  { n: '量子资源',  a: 'https://cj.lziapi.com/api.php/provide/vod/' },
   { n: '浩瀚资源',  a: 'https://hhzyapi.com/api.php/provide/vod/' },
+  { n: '360影视',   a: 'https://360zy.com/api.php/provide/vod/' },
+  { n: '光速资源',  a: 'https://api.guangsuapi.com/api.php/provide/vod/' },
   { n: '魔都资源',  a: 'https://caiji.moduapi.cc/api.php/provide/vod/' },
   { n: '虎牙资源',  a: 'https://www.huyaapi.com/api.php/provide/vod/' },
   { n: '无尽资源',  a: 'https://api.wujinapi.com/api.php/provide/vod/' },
   { n: '红牛资源',  a: 'https://hongniuzy2.com/api.php/provide/vod/' },
-  { n: '360影视',   a: 'https://360zy.com/api.php/provide/vod/' },
-  { n: '最大资源',  a: 'https://api.zuidapi.com/api.php/provide/vod/' },
+  { n: '2100影视', a: 'https://p2100.net/api.php/provide/vod/' },
   { n: '速播资源',  a: 'https://subocaiji.com/api.php/provide/vod/' },
-  { n: '光速资源',  a: 'https://api.guangsuapi.com/api.php/provide/vod/' },
+  { n: '最大资源',  a: 'https://api.zuidapi.com/api.php/provide/vod/' },
   { n: '爱奇艺资源', a: 'https://iqiyizyapi.com/api.php/provide/vod/' }
 ];
-var DB_SRC_MAX = 5;       // 详情页最多串行查几个站
+var DB_SRC_MAX = 5;       // 详情页同时并发查几个站（并发下加数量几乎不加时间）
 var DB_SRC_SCORE = 200;   // 片名相似度下限，低于它认为是别的片子，丢弃
 var DB_INDEX = {};        // vod_id -> 列表页那一条（豆瓣接口对个别老条目会 404，用它兜底）
 var DB_AGG = {};          // 片名 -> 聚合结果缓存
@@ -119,10 +156,14 @@ var DB_GENRE = ['剧情', '喜剧', '爱情', '动作', '科幻', '悬疑', '犯
 /* ⑤ 年代标签（j/search_subjects 的 movie 标签，「精选」Tab 的年代行） */
 var DB_ERA = [2024, 2022, 2021, 2020, 2019, 2018, 2017, 2016, 2015, 2014, 2013, 2012, 2011, 2010, 2009];
 
-/* 首页综合混流来源 */
+/* 首页综合混流来源
+ * 原来是 10 个源「串行」各请求一次，实测 4~8 秒，是首页慢的主因。
+ * 现在改成 6 个源「并发」：总耗时 = 最慢的那一个（约 1.5 秒），而不是 6 次累加。
+ * 源的取舍：去掉与 Top250 高度重复的高分榜，以及两个冷门标签，保留覆盖
+ * 综合热门 / 经典 / 新片口碑 / 剧集 / 综艺 / 精选 六个方向，去重后仍有 50 条左右。 */
 var DB_MIX = [
-  'rk|subject_real_time_hotest', 'rk|movie_top250', 'rk|movie_weekly_best', 'rk|tv_real_time_hotest',
-  'rk|show_hot', 'rk|movie_high_score', 'tg|movie|豆瓣高分', 'tg|movie|冷门佳片', 'tg|movie|华语', 'tg|tv|国产剧'
+  'rk|subject_real_time_hotest', 'rk|movie_top250', 'rk|movie_weekly_best',
+  'rk|tv_real_time_hotest', 'rk|show_hot', 'tg|movie|豆瓣高分'
 ];
 
 /*
@@ -296,13 +337,14 @@ function dbBanned(txt) {
  * hdr 不传时用豆瓣默认头（带 Referer，豆瓣接口缺它会被拒）；
  * 请求资源站时传一个不带豆瓣 Referer 的头（采集站对陌生 Referer 敏感）。
  * 失败重试：豆瓣限流时返回空串，稍等再试一次通常就能拿到数据。 */
-function dbFetchOnce(url, h) {
+function dbFetchOnce(url, h, ms) {
   var r, b, b2;
+  var to = ms || DB_TIMEOUT;
 
   // FongMi：req(url, { async: false }) => { code, headers, content }
   try {
     if (typeof req === 'function') {
-      r = req(url, { async: false, headers: h });
+      r = req(url, { async: false, headers: h, timeout: to });
       if (r && r.content && String(r.content).length) return String(r.content);
     }
   } catch (e) {}
@@ -310,7 +352,7 @@ function dbFetchOnce(url, h) {
   // FongMi：http(url, { async: false })
   try {
     if (typeof http === 'function') {
-      r = http(url, { async: false, headers: h });
+      r = http(url, { async: false, headers: h, timeout: to });
       if (r && r.content && String(r.content).length) return String(r.content);
     }
   } catch (e) {}
@@ -340,14 +382,14 @@ function dbWait(ms) {
   while (Date.now() < end) { /* spin */ }
 }
 
-function dbFetch(url, hdr) {
+function dbFetch(url, hdr, ms) {
   var cached = dbCacheGet(url);
   if (cached) return cached;
   var h = hdr || { 'User-Agent': DB_UA, 'Referer': dbRef(url), 'Accept': 'application/json' };
-  var txt = dbFetchOnce(url, h);
+  var txt = dbFetchOnce(url, h, ms);
   /* 豆瓣会对同一 IP 的密集请求返回「异常请求，请登录」的拒绝体（合法 JSON 但无数据）。
    * 退避再取一次通常能恢复；仍失败则兜底返回旧缓存，好过给用户空白页。 */
-  if (dbBanned(txt)) { dbWait(1500); txt = dbFetchOnce(url, h); }
+  if (dbBanned(txt)) { dbWait(1500); txt = dbFetchOnce(url, h, ms); }
   if (dbBanned(txt)) return dbCacheGet(url);
   return dbCachePut(url, txt);
 }
@@ -359,12 +401,119 @@ function dbJson(url) {
 }
 
 /* ============================================================================
+ * 并发网络层
+ * ----------------------------------------------------------------------------
+ * 两端注入的 _http(url, options) 签名与语义完全一致（已核对源码）：
+ *     Box     util/js/Global.java      @Function  public JSObject _http(...)
+ *     FongMi  quickjs/method/Global.java  @JSMethod public JSObject _http(...)
+ * 两者都是：options 里没有 complete 就当同步 req 处理并返回结果；
+ *          有 complete 就交给 OkHttp 的 enqueue 异步入队，函数本身返回 null。
+ * 也就是说它「发起异步请求」但「不返回 Promise」，Promise 要我们在 JS 侧自己包。
+ *
+ * 引擎侧会等我们返回的 Promise：
+ *     Box     util/js/Async.java     result instanceof JSObject -> then(result)
+ *     FongMi  quickjs/utils/Async.java  同样的写法
+ * 两个 Async 都是「拿到返回值，有 then 就挂回调等 resolve，否则直接当结果」，
+ * 且 Spider 里 home/category/detail/search/play 全部走这条路径。
+ * 所以方法返回 Promise 是安全的，而且这是唯一能真正并行的办法 ——
+ * QuickJS 是单线程，同步的 req 只能一个一个排队，脚本里做不到多线程。
+ *
+ * 降级：DB_PARALLEL 置 false，或环境里没有 _http / Promise，就整体走原来的同步串行。
+ * ========================================================================== */
+
+/* 环境探测：三个全局函数同属一套 QuickJS 注入，缺一个就说明是老引擎，不能用并发 */
+var DB_ASYNC = (typeof _http === 'function' && typeof Promise === 'function');
+
+/* 单个异步请求 -> Promise<文本>。命中内存缓存时直接 resolve，不再发请求。 */
+function dbFetchP(url, hdr, ms) {
+  var to = ms || DB_TIMEOUT;
+  var hit = dbCacheGet(url);
+  if (hit) return Promise.resolve(hit);
+  return new Promise(function (resolve) {
+    var done = false;
+    function fin(v) {
+      if (done) return;
+      done = true;
+      if (v && !dbBanned(v)) dbCachePut(url, v);
+      resolve(v || '');
+    }
+    try {
+      _http(url, {
+        headers: hdr || { 'User-Agent': DB_UA, 'Referer': dbRef(url), 'Accept': 'application/json' },
+        timeout: to,
+        complete: function (r) {
+          var c = '';
+          try { if (r && r.content) c = String(r.content); } catch (e) { c = ''; }
+          fin(c);
+        }
+      });
+    } catch (e) { fin(''); }
+    /* 超时兜底：任何一个请求不回调，Promise 就永远挂着，引擎会一直 await，
+     * 表现为详情页转圈不出内容。用引擎注入的 setTimeout 兜一手，绝不允许挂死。 */
+    try { setTimeout(function () { fin(''); }, to + 2000); } catch (e) {}
+  });
+}
+
+/* 一批请求并发。jobs: [{url, hdr, ms}] -> Promise<文本数组>
+ * 并发不可用时返回 null，调用方据此退回同步路径。 */
+function dbFetchAll(jobs) {
+  if (!DB_PARALLEL || !DB_ASYNC || !jobs || !jobs.length) return null;
+  var ps = [], i;
+  for (i = 0; i < jobs.length; i++) ps.push(dbFetchP(jobs[i].url, jobs[i].hdr, jobs[i].ms));
+  return Promise.all(ps);
+}
+
+/* 返回值统一出口：对象 / Promise<对象> 都能转成引擎要的 JSON 字符串 */
+function dbOut(v) {
+  if (v && typeof v.then === 'function') {
+    return v.then(function (o) { return JSON.stringify(o); });
+  }
+  return JSON.stringify(v);
+}
+
+/* ============================================================================
+ * 持久化（local）
+ * ----------------------------------------------------------------------------
+ * 内存缓存进程一退就清空，所以每次开盒子都要重新等一轮网络。local 写到
+ * Prefers / Hawk，是跨进程保存的，用来让「第二次打开」变成秒开。
+ * 所有调用都包了 try：某些壳子没注入 local，那就静默退化成不持久化，不影响功能。
+ * ========================================================================== */
+function dbStoreGet(k) {
+  try {
+    if (typeof local === 'undefined' || !local) return '';
+    var v = local.get(DB_STORE, k);
+    return v ? String(v) : '';
+  } catch (e) { return ''; }
+}
+function dbStoreSet(k, v) {
+  try {
+    if (typeof local === 'undefined' || !local) return;
+    v = String(v);
+    if (!v || v.length > DB_STORE_MAX) return;   // 太大的不写盘，避免撑爆 Prefers
+    local.set(DB_STORE, k, v);
+  } catch (e) {}
+}
+/* 读一个带时间戳的缓存包：过期返回空串 */
+function dbStorePack(k) {
+  var raw = dbStoreGet(k);
+  if (!raw) return '';
+  try {
+    var o = JSON.parse(raw);
+    if (!o || !o.t || Date.now() - o.t > DB_STORE_TTL) return '';
+    return o.v || '';
+  } catch (e) { return ''; }
+}
+function dbStoreSave(k, v) {
+  try { dbStoreSet(k, JSON.stringify({ t: Date.now(), v: v })); } catch (e) {}
+}
+
+/* ============================================================================
  * 详情页多站聚合
  * ========================================================================== */
 
-/* 请求采集站：不带豆瓣 Referer（采集站对陌生 Referer 敏感） */
+/* 请求采集站：不带豆瓣 Referer（采集站对陌生 Referer 敏感），超时按采集站的短时限 */
 function dbApiFetch(url) {
-  return dbFetch(url, { 'User-Agent': DB_UA, 'Accept': 'application/json' });
+  return dbFetch(url, { 'User-Agent': DB_UA, 'Accept': 'application/json' }, DB_SRC_TIMEOUT);
 }
 
 /* 归一化：只留中文、字母、数字，抹平空格与各种标点 */
@@ -418,9 +567,13 @@ function dbEps(pu) {
   return out.join('#');
 }
 
-/* 在单个资源站里找这部片，返回可直接用的播放列表（找不到返回空串） */
-function dbSrcLookup(src, title) {
-  var txt = dbApiFetch(src.a + '?ac=detail&wd=' + encodeURIComponent(title));
+function dbSrcUrl(src, title) {
+  return src.a + '?ac=detail&wd=' + encodeURIComponent(title);
+}
+
+/* 从一个采集站的响应文本里挑出这部片的播放列表（没命中返回空串）
+ * 拆成「纯解析」是为了让同步和并发两条路复用同一段逻辑。 */
+function dbSrcPick(txt, title) {
   if (!txt) return '';
   var d = null;
   try { d = JSON.parse(txt); } catch (e) { return ''; }
@@ -437,24 +590,117 @@ function dbSrcLookup(src, title) {
   return dbEps(best.vod_play_url);
 }
 
-/* 串行查 DB_SRC_MAX 个站，把有资源的站拼成 from / url 两条平行串（必须等长） */
-function dbAgg(title) {
-  title = String(title || '').trim();
-  if (!title) return null;
-  if (DB_AGG[title]) return DB_AGG[title];
-  if (DB_AGG_N > 60) { DB_AGG = {}; DB_AGG_N = 0; }
+/* 在单个资源站里找这部片（同步版） */
+function dbSrcLookup(src, title) {
+  return dbSrcPick(dbApiFetch(dbSrcUrl(src, title)), title);
+}
 
+/* 把若干站的命中结果拼成 from / url 两条平行串（必须等长，否则盒子会错位）
+ * off 是 txts 里采集站响应的起始下标：详情页会把豆瓣详情和采集站并到同一批请求里。 */
+function dbAggJoin(txts, title, off) {
   var from = [], url = [], i, n = Math.min(DB_SRC_MAX, DB_SRC.length);
+  off = off || 0;
   for (i = 0; i < n; i++) {
     var eps = '';
-    try { eps = dbSrcLookup(DB_SRC[i], title); } catch (e) { eps = ''; }
+    try { eps = dbSrcPick(txts[off + i], title); } catch (e) { eps = ''; }
     if (!eps) continue;
     from.push(DB_SRC[i].n);
     url.push(eps);
   }
-  var r = { from: from.join('$$$'), url: url.join('$$$') };
+  return { from: from.join('$$$'), url: url.join('$$$') };
+}
+
+/* 聚合结果入内存缓存 + 写盘 */
+function dbAggSave(title, r) {
+  if (!title || !r) return r;
+  if (DB_AGG_N > 60) { DB_AGG = {}; DB_AGG_N = 0; }
   DB_AGG[title] = r; DB_AGG_N++;
+  dbStoreSave('agg_' + title, JSON.stringify(r));
   return r;
+}
+
+/* 详情页条目组装：豆瓣元数据 + 聚合出来的线路。
+ * 抽成函数是因为并发路径和同步路径要共用这一段。 */
+function dbVod(id, d, agg) {
+  d = d || {};
+  var memo = DB_INDEX[id] || {};
+  var title = d.title || memo.vod_name || '';
+
+  var pic = '';
+  if (d.pic) pic = d.pic.normal || d.pic.large || d.pic.small || '';
+  if (!pic) pic = d.cover_url || memo.vod_pic || '';
+
+  var rating = (d.rating && d.rating.value) ? (d.rating.value + '分') : (memo.vod_remarks || '');
+  var actors = [], directors = [];
+  try {
+    var cs = d.actors || d.credits || [];
+    for (var i = 0; i < cs.length && i < 6; i++) actors.push(cs[i].title || cs[i].name || '');
+    var ds = d.directors || [];
+    for (var j = 0; j < ds.length && j < 3; j++) directors.push(ds[j].title || ds[j].name || '');
+  } catch (e) {}
+
+  var vod = {
+    vod_id: id,
+    vod_name: title,
+    vod_pic: dbPic(pic),
+    vod_remarks: rating,
+    vod_year: String(d.year || memo.vod_year || ''),
+    vod_area: (d.countries || []).join(','),
+    vod_actor: actors.join(','),
+    vod_director: directors.join(','),
+    vod_content: d.intro || d.card_subtitle || memo.vod_content || '',
+    type_name: (d.genres || []).join(',')
+  };
+
+  /* 有资源的站才进线路列表；两条串必须等长，否则盒子会错位 */
+  if (agg && agg.from && agg.url) {
+    vod.vod_play_from = agg.from;
+    vod.vod_play_url = agg.url;
+  }
+  return vod;
+}
+
+/* 同步串行版：并发不可用时的退路 */
+function dbAggSync(title) {
+  var txts = [], i, n = Math.min(DB_SRC_MAX, DB_SRC.length);
+  for (i = 0; i < n; i++) {
+    var t = '';
+    try { t = dbApiFetch(dbSrcUrl(DB_SRC[i], title)); } catch (e) { t = ''; }
+    txts.push(t);
+  }
+  return dbAggJoin(txts, title);
+}
+
+/* 多站聚合：优先并发（耗时 = 最慢的那一站），不可用则退回串行。
+ * 结果进内存缓存；同时按片名写一份到 local，下次开盒子直接读盘，不用重新查。 */
+function dbAgg(title, useAsync) {
+  title = String(title || '').trim();
+  if (!title) return null;
+  if (DB_AGG[title]) return DB_AGG[title];
+
+  var key = 'agg_' + title;
+  var saved = dbStorePack(key);
+  if (saved) {
+    try {
+      var o = JSON.parse(saved);
+      if (o && typeof o === 'object') { DB_AGG[title] = o; DB_AGG_N++; return o; }
+    } catch (e) {}
+  }
+
+  if (DB_AGG_N > 60) { DB_AGG = {}; DB_AGG_N = 0; }
+
+  if (useAsync && DB_PARALLEL && DB_ASYNC) {
+    var jobs = [], i, n = Math.min(DB_SRC_MAX, DB_SRC.length);
+    for (i = 0; i < n; i++) {
+      jobs.push({ url: dbSrcUrl(DB_SRC[i], title), hdr: { 'User-Agent': DB_UA, 'Accept': 'application/json' }, ms: DB_SRC_TIMEOUT });
+    }
+    var p = dbFetchAll(jobs);
+    if (p) {
+      return p.then(function (txts) { return dbAggSave(title, dbAggJoin(txts, title)); });
+    }
+  }
+
+  return dbAggSave(title, dbAggSync(title));
 }
 
 /* ---------- 数据转换 ---------- */
@@ -584,42 +830,111 @@ function dbNew(tags, ext, pg) {
   return { page: pg, pagecount: pagecount, limit: DB_SIZE, total: pg * DB_SIZE, list: list };
 }
 
-/* ---------- 首页混流用：取某个源第一页 ---------- */
-function dbPage(tid) {
+/* ---------- 首页混流 ----------
+ * 拆成「拼 URL」+「解析响应」两步，是为了让同步和并发两条路共用同一段逻辑。 */
+function dbPageUrl(tid) {
   if (String(tid).indexOf('rk|') === 0) {
-    var d = dbJson(DB_API + '/subject_collection/' + tid.slice(3) + '/items?start=0&count=' + DB_SIZE) || {};
-    var tn = dbRankName(tid.slice(3));
-    return dbMapRank(d.subject_collection_items || [], tn);
+    return DB_API + '/subject_collection/' + String(tid).slice(3) + '/items?start=0&count=' + DB_SIZE;
   }
   var p = String(tid).slice(3).split('|');
-  var t = dbJson(DB_TAG + '?type=' + encodeURIComponent(p[0]) + '&tag=' + encodeURIComponent(p[1]) +
-                 '&sort=rank&page_limit=' + DB_SIZE + '&page_start=0') || {};
-  return dbMapTag(t.subjects || [], p[1]);
+  return DB_TAG + '?type=' + encodeURIComponent(p[0]) + '&tag=' + encodeURIComponent(p[1]) +
+         '&sort=rank&page_limit=' + DB_SIZE + '&page_start=0';
 }
 
-/* 首页综合：多榜单轮转交错 */
-function dbMix() {
-  var pools = [], i, j;
-  for (i = 0; i < DB_MIX.length; i++) {
-    var list = dbPage(DB_MIX[i]);
-    var part = [];
-    for (j = 0; j < list.length && j < 10; j++) {
-      if (list[j].vod_name) part.push(list[j]);
-    }
-    pools.push(part);
+function dbPageParse(tid, txt) {
+  var d = null;
+  try { d = JSON.parse(txt); } catch (e) { d = null; }
+  if (!d) return [];
+  if (String(tid).indexOf('rk|') === 0) {
+    return dbMapRank(d.subject_collection_items || [], dbRankName(String(tid).slice(3)));
   }
-  var out = [], seen = {}, k;
+  var p = String(tid).slice(3).split('|');
+  return dbMapTag(d.subjects || [], p[1]);
+}
+
+function dbPage(tid) {
+  return dbPageParse(tid, dbFetch(dbPageUrl(tid)));
+}
+
+/* 多个榜单轮转交错 + 去重（首页混流的收尾） */
+function dbMixJoin(pools) {
+  var out = [], seen = {}, i, k, v, key;
   for (k = 0; k < 10; k++) {
     for (i = 0; i < pools.length; i++) {
-      var v = pools[i][k];
+      v = pools[i][k];
       if (!v || !v.vod_pic) continue;            // 无封面的不要
-      var key = v.vod_id || v.vod_name;          // 榜单之间有交叉，首页去重
+      key = v.vod_id || v.vod_name;              // 榜单之间有交叉，首页去重
       if (seen[key]) continue;
       seen[key] = 1;
       out.push(v);
     }
   }
   return out;
+}
+
+function dbMixPools(txts) {
+  var pools = [], i, j, list, part;
+  for (i = 0; i < DB_MIX.length; i++) {
+    list = dbPageParse(DB_MIX[i], txts[i]);
+    part = [];
+    for (j = 0; j < list.length && j < 10; j++) {
+      if (list[j].vod_name) part.push(list[j]);
+    }
+    pools.push(part);
+  }
+  return dbMixJoin(pools);
+}
+
+/* 完整混流（同步串行）：并发不可用时的退路 */
+function dbMix() {
+  var txts = [], i;
+  for (i = 0; i < DB_MIX.length; i++) txts.push(dbFetch(dbPageUrl(DB_MIX[i])));
+  return dbMixPools(txts);
+}
+
+/* 完整混流（并发）：返回 Promise，拿不到就返回 null 让调用方走同步 */
+function dbMixP() {
+  if (!DB_PARALLEL || !DB_ASYNC) return null;
+  var jobs = [], i;
+  for (i = 0; i < DB_MIX.length; i++) jobs.push({ url: dbPageUrl(DB_MIX[i]), hdr: null, ms: DB_TIMEOUT });
+  var p = dbFetchAll(jobs);
+  if (!p) return null;
+  return p.then(dbMixPools);
+}
+
+/* 首屏快出：只取 DB_MIX[0] 一个源（实时热门榜），最多 1 次请求。
+ * 首页的 class / filters 都是硬编码数组，生成耗时为 0，真正拖慢首屏的是内容；
+ * 所以首屏故意只发一个请求，让用户先看到菜单，完整混流留给用户点「综合推荐」时再跑。 */
+var DB_HOME_QUICK = 12;
+function dbMixQuick() {
+  var list = dbPage(DB_MIX[0]);
+  var out = [], seen = {}, i, v, key;
+  for (i = 0; i < list.length && out.length < DB_HOME_QUICK; i++) {
+    v = list[i];
+    if (!v || !v.vod_name || !v.vod_pic) continue;
+    key = v.vod_id || v.vod_name;
+    if (seen[key]) continue;
+    seen[key] = 1;
+    out.push(v);
+  }
+  return out;
+}
+
+/* 进程内缓存：跑过一次完整混流后，home 就不用再走快出路径了 */
+var DB_MIX_MEM = [];
+
+/* home 的 list 取值顺序：进程内缓存 -> 持久化缓存 -> 单源快出
+ * 前两者都是 0 次网络请求，所以只要看过一次完整混流，之后开盒子首页就是秒开。 */
+function dbHomeList() {
+  if (DB_MIX_MEM.length) return DB_MIX_MEM;
+  var saved = dbStorePack('mix');
+  if (saved) {
+    try {
+      var l = JSON.parse(saved);
+      if (l && l.length) { DB_MIX_MEM = l; return l; }
+    } catch (e) {}
+  }
+  return dbMixQuick();
 }
 
 /* ---------- 统一分发 ----------
@@ -631,12 +946,27 @@ function dbExt(x) {
   catch (e) { return {}; }
 }
 
+/* 完整混流跑出来之后：存进进程内缓存，并写一份到磁盘，供下次开盒子直接秒开 */
+function dbMixCache(l) {
+  if (!l || !l.length) return;
+  DB_MIX_MEM = l;
+  dbStoreSave('mix', JSON.stringify(l));
+}
+
 function dbList(tid, pg, ext) {
   ext = dbExt(ext);
   pg = parseInt(pg, 10) || 1;
 
   if (tid === 'mix') {
+    var p = dbMixP();
+    if (p) {
+      return p.then(function (mlist) {
+        dbMixCache(mlist);
+        return { page: 1, pagecount: 1, limit: mlist.length, total: mlist.length, list: mlist };
+      });
+    }
     var mlist = dbMix();
+    dbMixCache(mlist);
     return { page: 1, pagecount: 1, limit: mlist.length, total: mlist.length, list: mlist };
   }
   if (tid === 'rank') return dbRank(ext['榜单'] || 'movie_top250', pg);
@@ -696,73 +1026,85 @@ __JS_SPIDER__ = {
 
   init: function (ext) { return ''; },
 
-  /* 首页：9 个分类 Tab + 综合混流内容 + 4 组筛选器 */
+  /* 首页：9 个分类 Tab + 4 组筛选器（硬编码数组，0 毫秒生成）+ 一份「快出」内容。
+   *
+   * 为什么 list 不能留空：FongMi 的 SiteViewModel 只调 homeContent，**不会**补调
+   * homeVod（已核对 SiteViewModel.java，全文只有 homeContent）；
+   * Box 那边 homeVod 也只在 HOME_REC=1 时才走。所以 list 一空，首页就是永久空白。
+   * 因此这里始终给内容，但只发一个请求，让菜单先把画面占住。 */
   home: function (filter) {
-    return JSON.stringify({ 'class': DB_CATES, list: dbMix(), filters: DB_FILTERS });
+    return JSON.stringify({ 'class': DB_CATES, list: dbHomeList(), filters: DB_FILTERS });
   },
 
-  /* 首页推荐位（可留空，这里复用混流） */
+  /* 首页推荐位：完整混流（并发）。Box 在 HOME_REC=1 时调它；FongMi 不调，无副作用。 */
   homeVod: function () {
-    return JSON.stringify({ list: dbMix() });
+    var p = dbMixP();
+    if (p) return p.then(function (l) {
+      dbMixCache(l);
+      return JSON.stringify({ list: l });
+    });
+    var l = dbMix();
+    dbMixCache(l);
+    return JSON.stringify({ list: l });
   },
 
-  /* 分类列表：tid 为 9 个 Tab 之一；extend 为筛选器选中值（对象或 JSON 字符串） */
+  /* 分类列表：tid 为 9 个 Tab 之一；extend 为筛选器选中值（对象或 JSON 字符串）
+   * 返回值可能是对象也可能是 Promise，交给 dbOut 统一转 JSON 字符串。 */
   category: function (tid, pg, filter, extend) {
-    return JSON.stringify(dbList(tid, pg, extend));
+    return dbOut(dbList(tid, pg, extend));
   },
 
   /* 详情：豆瓣元数据 + 多资源站聚合
    * 打开详情页时就用片名去各资源站搜一遍，把命中的 m3u8 挂成「线路」，
-   * 这样点进去直接就能播，不必再去搜索页手动搜。 */
+   * 这样点进去直接就能播，不必再去搜索页手动搜。
+   *
+   * 并发路径：豆瓣详情的 movie / tv 两个接口，和 N 个采集站的搜索「同时」发出，
+   * 总耗时 = 最慢的那一个，而不是原来的「1~2 次豆瓣 + 5 站串行」累加。
+   * 只有已经从列表页拿到片名时才走并发（采集站搜索要用片名），
+   * 拿不到就退回同步路径，行为与旧版完全一致。 */
   detail: function (id) {
     id = String(id || '').trim();
+    var known = (DB_INDEX[id] || {}).vod_name || '';
 
-    /* 豆瓣详情：movie 接口对电影和剧集都通，404 时再试 tv（综艺类常只有 tv） */
-    var d = dbJson(DB_API + '/movie/' + id + '?platform=web');
-    if (!d || !d.title) {
-      var d2 = dbJson(DB_API + '/tv/' + id + '?platform=web');
-      if (d2 && d2.title) d = d2;
+    if (DB_PARALLEL && DB_ASYNC && known) {
+      var jobs = [
+        { url: DB_API + '/movie/' + id + '?platform=web', hdr: null, ms: DB_TIMEOUT },
+        { url: DB_API + '/tv/' + id + '?platform=web', hdr: null, ms: DB_TIMEOUT }
+      ];
+      var agg0 = DB_AGG[known];            // 已有聚合结果就不必再查采集站
+      var n = agg0 ? 0 : Math.min(DB_SRC_MAX, DB_SRC.length);
+      var i;
+      for (i = 0; i < n; i++) {
+        jobs.push({
+          url: dbSrcUrl(DB_SRC[i], known),
+          hdr: { 'User-Agent': DB_UA, 'Accept': 'application/json' },
+          ms: DB_SRC_TIMEOUT
+        });
+      }
+      var p = dbFetchAll(jobs);
+      if (p) {
+        return p.then(function (arr) {
+          var dm = null, dt = null;
+          try { dm = JSON.parse(arr[0]); } catch (e) { dm = null; }
+          try { dt = JSON.parse(arr[1]); } catch (e) { dt = null; }
+          /* movie 对电影和剧集都通；综艺类常常只有 tv，所以两个都发，谁有 title 用谁 */
+          var d = (dm && dm.title) ? dm : ((dt && dt.title) ? dt : (dm || dt || {}));
+          var agg = agg0 || dbAggSave(known, dbAggJoin(arr, known, 2));
+          return JSON.stringify({ list: [dbVod(id, d, agg)] });
+        });
+      }
     }
-    if (!d) d = {};
 
-    /* 片名：豆瓣优先，列表页缓存兜底（豆瓣对个别老条目会 404） */
+    /* 同步路径：豆瓣详情先拿，再串行查采集站 */
+    var d2 = dbJson(DB_API + '/movie/' + id + '?platform=web');
+    if (!d2 || !d2.title) {
+      var d3 = dbJson(DB_API + '/tv/' + id + '?platform=web');
+      if (d3 && d3.title) d2 = d3;
+    }
+    if (!d2) d2 = {};
     var memo = DB_INDEX[id] || {};
-    var title = d.title || memo.vod_name || '';
-
-    var pic = '';
-    if (d.pic) pic = d.pic.normal || d.pic.large || d.pic.small || '';
-    if (!pic) pic = d.cover_url || memo.vod_pic || '';
-
-    var rating = (d.rating && d.rating.value) ? (d.rating.value + '分') : (memo.vod_remarks || '');
-    var actors = [], directors = [];
-    try {
-      var cs = d.actors || d.credits || [];
-      for (var i = 0; i < cs.length && i < 6; i++) actors.push(cs[i].title || cs[i].name || '');
-      var ds = d.directors || [];
-      for (var j = 0; j < ds.length && j < 3; j++) directors.push(ds[j].title || ds[j].name || '');
-    } catch (e) {}
-
-    var vod = {
-      vod_id: id,
-      vod_name: title,
-      vod_pic: dbPic(pic),
-      vod_remarks: rating,
-      vod_year: String(d.year || memo.vod_year || ''),
-      vod_area: (d.countries || []).join(','),
-      vod_actor: actors.join(','),
-      vod_director: directors.join(','),
-      vod_content: d.intro || d.card_subtitle || memo.vod_content || '',
-      type_name: (d.genres || []).join(',')
-    };
-
-    /* 聚合：有资源的站才进线路列表；两条串必须等长，否则盒子会错位 */
-    var agg = dbAgg(title);
-    if (agg && agg.from && agg.url) {
-      vod.vod_play_from = agg.from;
-      vod.vod_play_url = agg.url;
-    }
-
-    return JSON.stringify({ list: [vod] });
+    var title = d2.title || memo.vod_name || '';
+    return JSON.stringify({ list: [dbVod(id, d2, dbAgg(title, false))] });
   },
 
   /* 搜索：豆瓣 j/subject_suggest
